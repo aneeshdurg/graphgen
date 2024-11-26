@@ -1,8 +1,8 @@
 use std::env;
 use std::fs::File;
 use std::io::prelude::*;
-use std::io::{self, BufRead, BufWriter};
-use std::path::{Path, PathBuf};
+use std::io::BufWriter;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
@@ -161,29 +161,25 @@ fn generate_chunk(args: Args, id: usize) {
     }
 }
 
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
-}
-
 fn generate(args: Args) {
     create_dir(&args.outdir);
     assert!(env::set_current_dir(&args.outdir).is_ok());
 
-    let mut nodefile =
-        BufWriter::new(File::create("nodes.csv").expect("Failed to create nodes.csv"));
-    nodefile
-        .write_all(b"NodeID|data\n")
-        .expect("Failed to write node header");
+    {
+        let mut nodefile =
+            BufWriter::new(File::create("nodes.csv").expect("Failed to create nodes.csv"));
+        nodefile
+            .write_all(b"NodeID|data\n")
+            .expect("Failed to write node header");
+    }
 
-    let mut edgefile =
-        BufWriter::new(File::create("edges.csv").expect("Failed to create edges.csv"));
-    edgefile
-        .write_all(b"SrcID|DstID\n")
-        .expect("Failed to write edge header");
+    {
+        let mut edgefile =
+            BufWriter::new(File::create("edges.csv").expect("Failed to create edges.csv"));
+        edgefile
+            .write_all(b"SrcID|DstID\n")
+            .expect("Failed to write edge header");
+    }
 
     // Make a vector to hold the children which are spawned.
     let mut children = vec![];
@@ -200,40 +196,24 @@ fn generate(args: Args) {
     for child in tqdm(children) {
         let _ = child.join();
         let childnodes = format!("nodes_{}.csv", i);
-        if let Ok(lines) = read_lines(&childnodes) {
-            // Consumes the iterator, returns an (Optional) String
-            for line in lines.flatten() {
-                nodefile
-                    .write_all(line.as_bytes())
-                    .expect("Failed to write to nodefile");
-
-                nodefile
-                    .write_all(b"\n")
-                    .expect("Failed to write to nodefile");
-            }
-        }
-        Command::new("rm")
-            .arg(childnodes)
-            .output()
-            .expect("failed to remove child node file");
-
         let childedges = format!("edges_{}.csv", i);
-        if let Ok(lines) = read_lines(&childedges) {
-            // Consumes the iterator, returns an (Optional) String
-            for line in lines.flatten() {
-                edgefile
-                    .write_all(line.as_bytes())
-                    .expect("Failed to write to edgefile");
-
-                edgefile
-                    .write_all(b"\n")
-                    .expect("Failed to write to edgefile");
-            }
-        }
-        Command::new("rm")
-            .arg(childedges)
+        Command::new("dd")
+            .arg(format!("if={}", childnodes))
+            .arg("bs=4k")
+            .arg("of=nodes.csv")
+            .arg("oflag=append")
             .output()
-            .expect("Failed to remove child edge file");
+            .expect("concat'ing node files failed");
+        Command::new("dd")
+            .arg(format!("if={}", childedges))
+            .arg("bs=4k")
+            .arg("of=edges.csv")
+            .arg("oflag=append")
+            .output()
+            .expect("concat'ing node files failed");
+
+        std::fs::remove_file(childnodes).expect("failed to remove child node file");
+        std::fs::remove_file(childedges).expect("failed to remove child node file");
         i += 1;
     }
 }
