@@ -226,6 +226,8 @@ fn generate(args: Args) {
             .arg("oflag=append")
             .output()
             .expect("concat'ing node files failed");
+        std::fs::remove_file(childnodes).expect("failed to remove child node file");
+
         Command::new("dd")
             .arg(format!("if={}", childedges))
             .arg("bs=4k")
@@ -233,8 +235,6 @@ fn generate(args: Args) {
             .arg("oflag=append")
             .output()
             .expect("concat'ing node files failed");
-
-        std::fs::remove_file(childnodes).expect("failed to remove child node file");
         std::fs::remove_file(childedges).expect("failed to remove child node file");
         i += 1;
     }
