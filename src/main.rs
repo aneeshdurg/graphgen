@@ -1,17 +1,16 @@
+use std::env;
+use std::fs::File;
+use std::io::prelude::*;
+use std::io::{self, BufRead, BufWriter};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+
 use clap::{Parser, ValueEnum};
-use rand;
 use rand::distributions::uniform::UniformFloat;
 use rand::Rng;
 use rand_distr::uniform::UniformSampler;
 use rand_distr::{Distribution, Exp, Normal};
-use std::env;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::{self, BufRead};
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::Command;
-use std::thread;
 use tqdm::tqdm;
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -57,18 +56,20 @@ fn create_dir(dir: &PathBuf) {
         .expect("failed to create outdir");
 }
 
-fn get_prop(
+fn get_prop<R>(
+    rng: &mut R,
     data_source: &mut File,
     prop_dist: &Dist,
     min_prop_size: usize,
     prop_range: usize,
-) -> String {
-    let mut rng = rand::thread_rng();
-
+) -> String
+where
+    R: Rng,
+{
     let f: f64 = match prop_dist {
-        Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(&mut rng),
+        Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(rng),
         Dist::Normal => {
-            let n = Normal::new(0.5, 0.5).unwrap().sample(&mut rng);
+            let n = Normal::new(0.5, 0.5).unwrap().sample(rng);
             if n > 1. {
                 1.
             } else if n < 0. {
@@ -77,7 +78,7 @@ fn get_prop(
                 n
             }
         }
-        Dist::Exp => Exp::new(0.5).unwrap().sample(&mut rng),
+        Dist::Exp => Exp::new(0.5).unwrap().sample(rng),
     };
     let mut buf = vec![0u8; min_prop_size + ((f * prop_range as f64) as usize)];
     data_source
@@ -86,13 +87,14 @@ fn get_prop(
     urlencoding::encode_binary(&buf).to_string()
 }
 
-fn get_n_edges(edge_dist: &Dist) -> usize {
-    let mut rng = rand::thread_rng();
-
+fn get_n_edges<R>(rng: &mut R, edge_dist: &Dist) -> usize
+where
+    R: Rng,
+{
     let f: f64 = match edge_dist {
-        Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(&mut rng),
+        Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(rng),
         Dist::Normal => {
-            let n = Normal::new(0.5, 0.5).unwrap().sample(&mut rng);
+            let n = Normal::new(0.5, 0.5).unwrap().sample(rng);
             if n > 1. {
                 1.
             } else if n < 0. {
@@ -102,7 +104,7 @@ fn get_n_edges(edge_dist: &Dist) -> usize {
             }
         }
         Dist::Exp => {
-            let e = Exp::new(0.5).unwrap().sample(&mut rng);
+            let e = Exp::new(0.5).unwrap().sample(rng);
             e * e
         }
     };
@@ -111,12 +113,15 @@ fn get_n_edges(edge_dist: &Dist) -> usize {
 }
 
 fn generate_chunk(args: Args, id: usize) {
-    let mut nodefile =
-        File::create(format!("nodes_{}.csv", id)).expect("Failed to create thread-local nodes.csv");
-    let mut edgefile =
-        File::create(format!("edges_{}.csv", id)).expect("Failed to create thread-local edges.csv");
-    let mut statsfile =
-        File::create(format!("stats_{}.txt", id)).expect("Failed to create thread-local stats.txt");
+    let mut nodefile = BufWriter::new(
+        File::create(format!("nodes_{}.csv", id)).expect("Failed to create thread-local nodes.csv"),
+    );
+    let mut edgefile = BufWriter::new(
+        File::create(format!("edges_{}.csv", id)).expect("Failed to create thread-local edges.csv"),
+    );
+    let mut statsfile = BufWriter::new(
+        File::create(format!("stats_{}.txt", id)).expect("Failed to create thread-local stats.txt"),
+    );
 
     let prop_range = args.max_prop_size - args.min_prop_size;
     let mut data_source = File::open("/dev/urandom").expect("Failed to open urandom");
@@ -126,8 +131,11 @@ fn generate_chunk(args: Args, id: usize) {
     let start = chunksize * id;
     let end = std::cmp::min(start + chunksize, args.n_nodes);
 
+    let mut rng = rand::thread_rng();
+
     for nid in tqdm(start..end) {
         let prop = get_prop(
+            &mut rng,
             &mut data_source,
             &args.prop_dist,
             args.min_prop_size,
@@ -138,7 +146,7 @@ fn generate_chunk(args: Args, id: usize) {
             .write_all(node.as_bytes())
             .expect("Failed to write node");
 
-        let n_edges = get_n_edges(&args.edge_dist);
+        let n_edges = get_n_edges(&mut rng, &args.edge_dist);
         let stats = format!("{} {}\n", nid, n_edges);
         statsfile
             .write_all(stats.as_bytes())
@@ -165,12 +173,14 @@ fn generate(args: Args) {
     create_dir(&args.outdir);
     assert!(env::set_current_dir(&args.outdir).is_ok());
 
-    let mut nodefile = File::create("nodes.csv").expect("Failed to create nodes.csv");
+    let mut nodefile =
+        BufWriter::new(File::create("nodes.csv").expect("Failed to create nodes.csv"));
     nodefile
         .write_all(b"NodeID|data\n")
         .expect("Failed to write node header");
 
-    let mut edgefile = File::create("edges.csv").expect("Failed to create edges.csv");
+    let mut edgefile =
+        BufWriter::new(File::create("edges.csv").expect("Failed to create edges.csv"));
     edgefile
         .write_all(b"SrcID|DstID\n")
         .expect("Failed to write edge header");
