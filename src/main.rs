@@ -80,7 +80,7 @@ where
         }
         Dist::Exp => Exp::new(0.5).unwrap().sample(rng),
     };
-    let mut buf = vec![0u8; min_prop_size + ((f * prop_range as f64) as usize)];
+    let mut buf = vec![0u8; (min_prop_size + ((f * prop_range as f64) as usize)) / 3];
     data_source
         .read_exact(&mut buf)
         .expect("Failed to read from urandom");
@@ -125,13 +125,18 @@ fn generate_chunk(args: Args, id: usize) {
 
     let prop_range = args.max_prop_size - args.min_prop_size;
     let mut data_source = File::open("/dev/urandom").expect("Failed to open urandom");
-    //let mut buf = vec![0u8; bytes_to_read];
-    // reader.read_exact(&mut buf)?;
+
     let chunksize = args.n_nodes / args.nprocs;
     let start = chunksize * id;
     let end = std::cmp::min(start + chunksize, args.n_nodes);
 
     let mut rng = rand::thread_rng();
+
+    let mut node_line =
+        String::with_capacity(format!("{}|\n", args.n_nodes).len() + args.max_prop_size * 4);
+    let edge_line_len = format!("{}|{}\n", args.n_nodes, args.n_nodes).len();
+    let mut edge_line = String::with_capacity(edge_line_len);
+    let mut stats_line = String::with_capacity(edge_line_len);
 
     for nid in tqdm(start..end) {
         let prop = get_prop(
@@ -141,23 +146,40 @@ fn generate_chunk(args: Args, id: usize) {
             args.min_prop_size,
             prop_range,
         );
-        let node = format!("{}|{}\n", nid, prop);
+        let nid_str = &nid.to_string();
+
+        node_line.push_str(&nid_str);
+        node_line.push_str("|");
+        node_line.push_str(&prop);
+        node_line.push_str("\n");
         nodefile
-            .write_all(node.as_bytes())
+            .write_all(node_line.as_bytes())
             .expect("Failed to write node");
+        node_line.clear();
 
         let n_edges = get_n_edges(&mut rng, &args.edge_dist);
-        let stats = format!("{} {}\n", nid, n_edges);
+        stats_line.push_str(&nid_str);
+        stats_line.push_str(" ");
+        stats_line.push_str(&n_edges.to_string());
+        stats_line.push_str("\n");
         statsfile
-            .write_all(stats.as_bytes())
+            .write_all(stats_line.as_bytes())
             .expect("Failed to write stats");
+        stats_line.clear();
+
+        edge_line.push_str(&nid_str);
+        edge_line.push_str("|");
+        let prefix_len = edge_line.len();
         for _ in 0..n_edges {
             let dst = rand::thread_rng().gen_range(0..args.n_nodes);
-            let edge = format!("{}|{}\n", nid, dst);
+            edge_line.push_str(&dst.to_string());
+            edge_line.push_str("\n");
             edgefile
-                .write_all(edge.as_bytes())
+                .write_all(edge_line.as_bytes())
                 .expect("Failed to write edge");
+            edge_line.truncate(prefix_len);
         }
+        edge_line.clear();
     }
 }
 
