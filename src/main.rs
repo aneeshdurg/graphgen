@@ -4,6 +4,7 @@ use std::io::prelude::*;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::channel;
 use std::thread;
 
 use clap::{Parser, ValueEnum};
@@ -46,6 +47,9 @@ struct Args {
     /// Number of processes
     #[arg(long, default_value = "8")]
     nprocs: usize,
+
+    #[arg(long, default_value = "4k")]
+    ddblocksizearg: String,
 }
 
 fn create_dir(dir: &PathBuf) {
@@ -203,25 +207,24 @@ fn generate(args: Args) {
             .expect("Failed to write edge header");
     }
 
-    // Make a vector to hold the children which are spawned.
-    let mut children = vec![];
-
+    let (tx, rx) = channel();
     for i in 0..args.nprocs {
         let args_copy = args.clone();
-        // Spin up another thread
-        children.push(thread::spawn(move || {
+        let tx = tx.clone();
+        thread::spawn(move || {
             generate_chunk(args_copy, i);
-        }));
+            tx.send(i).unwrap();
+        });
     }
 
-    let mut i = 0;
-    for child in tqdm(children) {
-        let _ = child.join();
+    let ddblocksize = format!("bs={}", args.ddblocksizearg);
+    for _ in tqdm(0..args.nprocs) {
+        let i = rx.recv().unwrap();
         let childnodes = format!("nodes_{}.csv", i);
         let childedges = format!("edges_{}.csv", i);
         Command::new("dd")
             .arg(format!("if={}", childnodes))
-            .arg("bs=4k")
+            .arg(&ddblocksize)
             .arg("of=nodes.csv")
             .arg("oflag=append")
             .output()
@@ -230,13 +233,12 @@ fn generate(args: Args) {
 
         Command::new("dd")
             .arg(format!("if={}", childedges))
-            .arg("bs=4k")
+            .arg(&ddblocksize)
             .arg("of=edges.csv")
             .arg("oflag=append")
             .output()
             .expect("concat'ing node files failed");
         std::fs::remove_file(childedges).expect("failed to remove child node file");
-        i += 1;
     }
 }
 
