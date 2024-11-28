@@ -1,10 +1,8 @@
 use std::env;
-use std::fs::File;
-use std::io::prelude::*;
-use std::io::BufWriter;
+use std::fs::{File, OpenOptions};
+use std::io::{prelude::*, BufReader, BufWriter, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc::channel;
 use std::thread;
 
 use clap::{Parser, ValueEnum};
@@ -12,7 +10,7 @@ use rand::distributions::uniform::UniformFloat;
 use rand::Rng;
 use rand_distr::uniform::UniformSampler;
 use rand_distr::{Distribution, Exp, Normal};
-use tqdm::tqdm;
+use tqdm::{pbar, tqdm};
 
 #[derive(Clone, Debug, ValueEnum, PartialEq)]
 enum Dist {
@@ -56,9 +54,6 @@ struct Args {
     /// Number of processes
     #[arg(long, default_value = "8")]
     nprocs: usize,
-
-    #[arg(long, hide = true, default_value = "4k")]
-    ddblocksizearg: String,
 
     /// Generate chunks that can be used to incrementally build the graph - 1 chunk per thread
     #[arg(long)]
@@ -211,12 +206,14 @@ fn generate_chunk(args: Args, id: usize) {
         edge_line.push_str("|");
         let prefix_len = edge_line.len();
         for _ in 0..n_edges {
-            let end = if args.generatechunks {
-                nid
+            // If we are generating individual chunks, we must ensure that each chunk only refers to
+            // nodes that exist within this chunk, or any prior chunks.
+            let maxnid = if args.generatechunks {
+                end
             } else {
                 args.n_nodes
             };
-            let dst = rand::thread_rng().gen_range(0..end);
+            let dst = rand::thread_rng().gen_range(0..maxnid);
             edge_line.push_str(&dst.to_string());
             if has_edge_props {
                 edge_line.push_str("|");
@@ -238,34 +235,136 @@ fn generate_chunk(args: Args, id: usize) {
     }
 }
 
+fn combine_chunks(args: &Args) {
+    let nodefile = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("nodes.csv")
+        .expect("Failed to create nodes.csv");
+    let edgefile = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("edges.csv")
+        .expect("Failed to create edges.csv");
+
+    // Determine how big each chunk was and compute a prefix sum of the lengths (note that the
+    // output files already have headers, so we need to account for those in the offsets)
+    let mut nodefiles = vec![];
+    let mut nodeoffsets = vec![nodefile.metadata().unwrap().len()];
+    let mut edgefiles = vec![];
+    let mut edgeoffsets = vec![edgefile.metadata().unwrap().len()];
+    for i in tqdm(0..args.nprocs) {
+        let childnodefile = File::open(format!("nodes_{}.csv", i)).unwrap();
+        nodeoffsets.push(nodeoffsets[i] + childnodefile.metadata().unwrap().len());
+        nodefiles.push(childnodefile);
+
+        let childedgefile = File::open(format!("edges_{}.csv", i)).unwrap();
+        edgeoffsets.push(edgeoffsets[i] + childedgefile.metadata().unwrap().len());
+        edgefiles.push(childedgefile);
+    }
+    // Set the node/edge files to be as big as the sum of all chunks
+    nodefile
+        .set_len(*nodeoffsets.last().unwrap())
+        .expect("Failed to set length of node file");
+    edgefile
+        .set_len(*edgeoffsets.last().unwrap())
+        .expect("Failed to set length of edge file");
+    drop(nodefile);
+    drop(edgefile);
+
+    // For each chunk, create a thread and open the output files at an offset from the prefix sum,
+    // so that each thread has a unique range to copy a chunk into.
+    let mut children = vec![];
+    for i in 0..args.nprocs {
+        let nstart = nodeoffsets[i];
+        let estart = edgeoffsets[i];
+
+        let total_bytes = nodeoffsets[i + 1] - nstart + edgeoffsets[i + 1] - estart;
+        children.push(thread::spawn(move || {
+            let mut nodefile = OpenOptions::new()
+                .write(true)
+                .open("nodes.csv")
+                .expect("Failed to create nodes.csv");
+            nodefile
+                .seek(SeekFrom::Start(nstart))
+                .expect("Failed to seek nodes.csv");
+
+            let mut edgefile = OpenOptions::new()
+                .write(true)
+                .open("edges.csv")
+                .expect("Failed to create edges.csv");
+            edgefile
+                .seek(SeekFrom::Start(estart))
+                .expect("Failed to seek edges.csv");
+
+            let childnodes_name = format!("nodes_{}.csv", i);
+            let childedges_name = format!("edges_{}.csv", i);
+
+            let childnodefile =
+                BufReader::new(File::open(&childnodes_name).expect("Failed to open node file"));
+            let childedgefile =
+                BufReader::new(File::open(&childedges_name).expect("Failed to open edge file"));
+
+            let mut nodefile = BufWriter::new(nodefile);
+            let mut edgefile = BufWriter::new(edgefile);
+
+            let mut pbar = pbar(Some(total_bytes as usize));
+
+            for line in childnodefile.lines().flatten() {
+                nodefile
+                    .write_all(line.as_bytes())
+                    .expect("Failed to write to nodefile");
+
+                nodefile
+                    .write_all(b"\n")
+                    .expect("Failed to write to nodefile");
+                pbar.update(line.as_bytes().len() + 1).expect("");
+            }
+            std::fs::remove_file(childnodes_name).expect("failed to remove child node file");
+
+            for line in childedgefile.lines().flatten() {
+                edgefile
+                    .write_all(line.as_bytes())
+                    .expect("Failed to write to edgefile");
+
+                edgefile
+                    .write_all(b"\n")
+                    .expect("Failed to write to edgefile");
+                pbar.update(line.as_bytes().len() + 1).expect("");
+            }
+            std::fs::remove_file(childedges_name).expect("failed to remove child edge file");
+        }));
+    }
+    for child in children {
+        child.join().expect("Failed to join thread");
+    }
+}
+
 fn generate(args: Args) {
     create_dir(&args.outdir);
     assert!(env::set_current_dir(&args.outdir).is_ok());
 
     {
-        let mut nodefile =
-            BufWriter::new(File::create("nodes.csv").expect("Failed to create nodes.csv"));
+        let mut nodefile = File::create("nodes.csv").expect("Failed to create nodes.csv");
         nodefile
             .write_all(b"NodeID|data\n")
             .expect("Failed to write node header");
-    }
-
-    {
-        let mut edgefile =
-            BufWriter::new(File::create("edges.csv").expect("Failed to create edges.csv"));
+        let mut edgefile = File::create("edges.csv").expect("Failed to create edges.csv");
         edgefile
             .write_all(b"SrcID|DstID\n")
             .expect("Failed to write edge header");
     }
 
-    let (tx, rx) = channel();
+    let mut children = vec![];
     for i in 0..args.nprocs {
         let args_copy = args.clone();
-        let tx = tx.clone();
-        thread::spawn(move || {
+        children.push(thread::spawn(move || {
             generate_chunk(args_copy, i);
-            tx.send(i).unwrap();
-        });
+        }));
+    }
+
+    for child in children {
+        child.join().expect("Failed to join thread");
     }
 
     // If we're generating chunks, we can just exit here since we don't need to combine all the
@@ -273,30 +372,7 @@ fn generate(args: Args) {
     if args.generatechunks {
         return;
     }
-
-    let ddblocksize = format!("bs={}", args.ddblocksizearg);
-    for _ in tqdm(0..args.nprocs) {
-        let i = rx.recv().unwrap();
-        let childnodes = format!("nodes_{}.csv", i);
-        let childedges = format!("edges_{}.csv", i);
-        Command::new("dd")
-            .arg(format!("if={}", childnodes))
-            .arg(&ddblocksize)
-            .arg("of=nodes.csv")
-            .arg("oflag=append")
-            .output()
-            .expect("concat'ing node files failed");
-        std::fs::remove_file(childnodes).expect("failed to remove child node file");
-
-        Command::new("dd")
-            .arg(format!("if={}", childedges))
-            .arg(&ddblocksize)
-            .arg("of=edges.csv")
-            .arg("oflag=append")
-            .output()
-            .expect("concat'ing node files failed");
-        std::fs::remove_file(childedges).expect("failed to remove child node file");
-    }
+    combine_chunks(&args);
 }
 
 fn main() {
