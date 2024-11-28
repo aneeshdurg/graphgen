@@ -14,10 +14,15 @@ use rand_distr::uniform::UniformSampler;
 use rand_distr::{Distribution, Exp, Normal};
 use tqdm::tqdm;
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, ValueEnum, PartialEq)]
 enum Dist {
+    /// Do not generate any values
+    None,
+    /// Generate values with a uniform distibution
     Uniform,
+    /// Generate values with a normal distibution
     Normal,
+    /// Generate values with a exponential distibution
     Exp,
 }
 
@@ -36,9 +41,13 @@ struct Args {
     #[arg(long)]
     edge_dist: Dist,
 
-    /// Edge distribution
+    /// Node property size distribution
     #[arg(long)]
-    prop_dist: Dist,
+    node_prop_dist: Dist,
+
+    /// Edge property size distribution
+    #[arg(long, default_value = "none")]
+    edge_prop_dist: Dist,
 
     /// Output directory
     #[arg(long, default_value = ".")]
@@ -48,8 +57,12 @@ struct Args {
     #[arg(long, default_value = "8")]
     nprocs: usize,
 
-    #[arg(long, default_value = "4k")]
+    #[arg(long, hide = true, default_value = "4k")]
     ddblocksizearg: String,
+
+    /// Generate chunks that can be used to incrementally build the graph - 1 chunk per thread
+    #[arg(long)]
+    generatechunks: bool,
 }
 
 fn create_dir(dir: &PathBuf) {
@@ -71,6 +84,7 @@ where
     R: Rng,
 {
     let f: f64 = match prop_dist {
+        Dist::None => 0.,
         Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(rng),
         Dist::Normal => {
             let n = Normal::new(0.5, 0.5).unwrap().sample(rng);
@@ -96,6 +110,7 @@ where
     R: Rng,
 {
     let f: f64 = match edge_dist {
+        Dist::None => 0.,
         Dist::Uniform => UniformFloat::<f64>::new(0.0, 1.0).sample(rng),
         Dist::Normal => {
             let n = Normal::new(0.5, 0.5).unwrap().sample(rng);
@@ -136,25 +151,46 @@ fn generate_chunk(args: Args, id: usize) {
 
     let mut rng = rand::thread_rng();
 
-    let mut node_line =
-        String::with_capacity(format!("{}|\n", args.n_nodes).len() + args.max_prop_size * 4);
-    let edge_line_len = format!("{}|{}\n", args.n_nodes, args.n_nodes).len();
-    let mut edge_line = String::with_capacity(edge_line_len);
-    let mut stats_line = String::with_capacity(edge_line_len);
+    let has_node_props = args.node_prop_dist != Dist::None;
+    let has_edge_props = args.edge_prop_dist != Dist::None;
+
+    let mut node_line = String::with_capacity(
+        format!("{}\n", args.n_nodes).len()
+            + if has_node_props {
+                // If we are adding node properties, reserve space for them. 1 bytes for '|' plus
+                // the actual property
+                1 + args.max_prop_size * 4
+            } else {
+                0
+            },
+    );
+    let two_ids_len = format!("{}|{}\n", args.n_nodes, args.n_nodes).len();
+    let mut edge_line = String::with_capacity(
+        two_ids_len
+            + if has_edge_props {
+                // If we are adding edge properties, reserve space for them. 1 bytes for '|' plus
+                // the actual property
+                1 + args.max_prop_size * 4
+            } else {
+                0
+            },
+    );
+    let mut stats_line = String::with_capacity(two_ids_len);
 
     for nid in tqdm(start..end) {
-        let prop = get_prop(
-            &mut rng,
-            &mut data_source,
-            &args.prop_dist,
-            args.min_prop_size,
-            prop_range,
-        );
         let nid_str = &nid.to_string();
 
         node_line.push_str(&nid_str);
-        node_line.push_str("|");
-        node_line.push_str(&prop);
+        if has_node_props {
+            node_line.push_str("|");
+            node_line.push_str(&get_prop(
+                &mut rng,
+                &mut data_source,
+                &args.node_prop_dist,
+                args.min_prop_size,
+                prop_range,
+            ));
+        }
         node_line.push_str("\n");
         nodefile
             .write_all(node_line.as_bytes())
@@ -175,8 +211,23 @@ fn generate_chunk(args: Args, id: usize) {
         edge_line.push_str("|");
         let prefix_len = edge_line.len();
         for _ in 0..n_edges {
-            let dst = rand::thread_rng().gen_range(0..args.n_nodes);
+            let end = if args.generatechunks {
+                nid
+            } else {
+                args.n_nodes
+            };
+            let dst = rand::thread_rng().gen_range(0..end);
             edge_line.push_str(&dst.to_string());
+            if has_edge_props {
+                edge_line.push_str("|");
+                edge_line.push_str(&get_prop(
+                    &mut rng,
+                    &mut data_source,
+                    &args.edge_prop_dist,
+                    args.min_prop_size,
+                    prop_range,
+                ));
+            }
             edge_line.push_str("\n");
             edgefile
                 .write_all(edge_line.as_bytes())
@@ -215,6 +266,12 @@ fn generate(args: Args) {
             generate_chunk(args_copy, i);
             tx.send(i).unwrap();
         });
+    }
+
+    // If we're generating chunks, we can just exit here since we don't need to combine all the
+    // files at the end.
+    if args.generatechunks {
+        return;
     }
 
     let ddblocksize = format!("bs={}", args.ddblocksizearg);
