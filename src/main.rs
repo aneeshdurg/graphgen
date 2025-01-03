@@ -22,6 +22,8 @@ enum Dist {
     Normal,
     /// Generate values with a exponential distibution
     Exp,
+    /// Constant value
+    Const,
 }
 
 /// Generate graphs with different edge and property distributions
@@ -92,6 +94,7 @@ where
             }
         }
         Dist::Exp => Exp::new(0.5).unwrap().sample(rng),
+        Dist::Const => 1.,
     };
     let mut buf = vec![0u8; (min_prop_size + ((f * prop_range as f64) as usize)) / 3];
     data_source
@@ -121,6 +124,7 @@ where
             let e = Exp::new(0.5).unwrap().sample(rng);
             e * e
         }
+        Dist::Const => unreachable!(),
     };
 
     (f * 10000.) as usize
@@ -377,5 +381,6 @@ fn generate(args: Args) {
 
 fn main() {
     let args = Args::parse();
+    assert!(args.edge_dist != Dist::Const);
     generate(args);
 }
