@@ -93,7 +93,7 @@ where
                 n
             }
         }
-        Dist::Exp => Exp::new(0.5).unwrap().sample(rng),
+        Dist::Exp => f64::clamp(Exp::new(0.5).unwrap().sample(rng) / 15., 0.0, 1.0),
         Dist::Const => 1.,
     };
     let mut buf = vec![0u8; (min_prop_size + ((f * prop_range as f64) as usize)) / 3];
